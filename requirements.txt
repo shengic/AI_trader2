@@ -1,0 +1,8 @@
+playwright
+google-generativeai
+streamlit
+python-dotenv
+pillow
+asyncio
+pandas
+openpyxl
