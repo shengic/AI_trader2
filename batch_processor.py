@@ -30,7 +30,8 @@ async def internal_capture(url, output_path, selector=None, height=1500):
     """複刻 capture.py 的核心邏輯，確保參數一致"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        scale_factor = 4.166666666666667 # 400 DPI
+        # 降級至 200 DPI (Token 節省約 50%+)
+        scale_factor = 2.0 
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport={"width": 1280, "height": int(height)},
@@ -60,7 +61,7 @@ def read_excel_safely(path, **kwargs):
             try: os.remove(temp_path)
             except: pass
 
-async def process_from_db(model_name="gemini-2.5-flash", target_period="1 year", tickers=None, progress_callback=None, max_concurrent=5):
+async def process_from_db(model_name="gemini-2.0-flash", target_period="1 year", tickers=None, progress_callback=None, max_concurrent=2):
     """
     從 MySQL 資料庫讀取監控清單並進行分析
     """

@@ -92,9 +92,8 @@ with st.sidebar:
                 st.session_state.menu = f"rule_{ticker}"
                 st.rerun()
 
-    st.divider()
     st.subheader("⚙️ 系統設定")
-    model_choice = st.selectbox("選擇 AI 模型", ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"])
+    model_choice = st.selectbox("選擇 AI 模型", ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"], index=0)
     st.divider()
 
 # --- 彈出視窗實作 ---

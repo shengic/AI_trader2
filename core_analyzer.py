@@ -10,9 +10,10 @@ load_dotenv()
 # 設定 API Key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-def get_model(model_name="gemini-2.5-flash"):
-    """取得 Gemini 模型實例"""
+def get_model(model_name="gemini-2.0-flash"):
+    """取得 Gemini 模型實例實例"""
     return genai.GenerativeModel(model_name)
+
 
 def load_rules(ticker=None, include_global=True):
     """讀取全域與特定個股規則"""
