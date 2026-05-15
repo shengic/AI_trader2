@@ -16,13 +16,19 @@ def get_model(model_name="gemini-2.5-flash"):
 
 def load_rules(ticker=None, include_global=True):
     """讀取全域與特定個股規則"""
+    from db_manager import get_global_rule
     rules = ""
     if include_global:
-        # 讀取全域規則
-        global_rules_path = "rules/global.txt"
-        if os.path.exists(global_rules_path):
-            with open(global_rules_path, "r", encoding="utf-8") as f:
-                rules += f"【全域分析規則】\n{f.read()}\n\n"
+        # 優先從資料庫讀取全域規則
+        global_rules = get_global_rule()
+        if not global_rules:
+            global_rules_path = "rules/global.txt"
+            if os.path.exists(global_rules_path):
+                with open(global_rules_path, "r", encoding="utf-8") as f:
+                    global_rules = f.read()
+            else:
+                global_rules = "未設定全域規則。"
+        rules += f"【全域分析規則】\n{global_rules}\n\n"
     
     # 讀取個股規則
     if ticker:
@@ -35,12 +41,17 @@ def load_rules(ticker=None, include_global=True):
 
 def create_global_cache(model_name="gemini-2.5-flash"):
     """建立全域規則快取"""
-    global_rules_path = "rules/global.txt"
-    if not os.path.exists(global_rules_path):
-        return None
+    from db_manager import get_global_rule
     
-    with open(global_rules_path, "r", encoding="utf-8") as f:
-        global_content = f.read()
+    # 優先從資料庫讀取全域規則
+    global_content = get_global_rule()
+    if not global_content:
+        global_rules_path = "rules/global.txt"
+        if os.path.exists(global_rules_path):
+            with open(global_rules_path, "r", encoding="utf-8") as f:
+                global_content = f.read()
+        else:
+            return None
 
     # 建立快取 (有效期預設 1 小時)
     cache = caching.CachedContent.create(

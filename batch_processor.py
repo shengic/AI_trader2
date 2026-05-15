@@ -60,26 +60,41 @@ def read_excel_safely(path, **kwargs):
             try: os.remove(temp_path)
             except: pass
 
-async def process_from_excel(excel_path, model_name="gemini-2.5-flash", capture_only=False, max_concurrent=5, tickers_to_process=None, progress_callback=None):
+async def process_from_db(model_name="gemini-2.5-flash", target_period="1 year", tickers=None, progress_callback=None, max_concurrent=5):
     """
-    從 Excel 讀取名單並併發處理，支援實時進度回報
+    從 MySQL 資料庫讀取監控清單並進行分析
     """
-    df = read_excel_safely(excel_path, header=None)
-    if df is None: return {}
-
-    process_list = []
-    if tickers_to_process: tickers_to_process = [str(t).strip().upper() for t in tickers_to_process]
+    from db_manager import get_watchlist_data
     
-    for index, row in df.iterrows():
-        if index == 0: continue
-        ticker = str(row.iloc[0]).strip().upper()
-        if pd.isna(row.iloc[0]) or ticker in ["NAN", "STOCK NAME", ""]: continue
-        if tickers_to_process and ticker not in tickers_to_process: continue
-        period = str(row.iloc[1]).strip().lower() if not pd.isna(row.iloc[1]) else "1 year"
-        extra_rules = str(row.iloc[2]) if len(row) > 2 and not pd.isna(row.iloc[2]) else ""
-        process_list.append({"ticker": ticker, "period": period, "extra_rules": extra_rules, "row_idx": index})
+    # 取得監控清單 (包含 ticker, local_rule, default_period)
+    watchlist = get_watchlist_data()
+    
+    process_list = []
+    for item in watchlist:
+        ticker = item['ticker']
+        # 如果用戶指定了特定股票，則過濾
+        if tickers and ticker not in tickers:
+            continue
+        
+        # 優先順序：個股設定週期 > UI 傳入的全域週期
+        final_period = item['default_period'] if item.get('default_period') else target_period
+        
+        process_list.append({
+            "ticker": ticker,
+            "period": final_period,
+            "extra_rules": item['local_rule'] or "",
+            "row_idx": 0 # 資料庫模式不需要 Excel 索引
+        })
 
-    if not process_list: return {}
+    if not process_list:
+        return {}
+
+    return await run_batch_core(process_list, model_name, capture_only=False, max_concurrent=max_concurrent, progress_callback=progress_callback)
+
+async def run_batch_core(process_list, model_name, capture_only=False, max_concurrent=5, progress_callback=None):
+    """
+    核心批次處理邏輯 (被 Excel 和 DB 共享)
+    """
     total = len(process_list)
     today = datetime.datetime.now().strftime("%Y%m%d")
     os.makedirs(f"captures/{today}", exist_ok=True)
@@ -90,10 +105,9 @@ async def process_from_excel(excel_path, model_name="gemini-2.5-flash", capture_
         if progress_callback: progress_callback(0, total, "SYSTEM", "running", "正在初始化 AI 全域快取...")
         try:
             from core_analyzer import create_global_cache
-            # 2026 年模型映射
-            if "3.1" in model_name: cache_model = "gemini-3.1-flash-lite"
-            elif "2.5" in model_name: cache_model = "gemini-2.5-flash" if "flash" in model_name else "gemini-2.5-pro"
-            else: cache_model = "gemini-2.0-flash"
+            # 模型映射
+            cache_model = "gemini-2.5-flash" if "flash" in model_name else "gemini-2.5-pro"
+            if "2.0" in model_name: cache_model = "gemini-2.0-flash"
             
             cache = create_global_cache(cache_model)
             cache_name = cache.name
@@ -119,17 +133,34 @@ async def process_from_excel(excel_path, model_name="gemini-2.5-flash", capture_
 
     tasks = [wrapped_task(item) for item in process_list]
     task_results_all = await asyncio.gather(*tasks)
-    for res in task_results_all:
-        results[res["ticker"]] = res
-
+    
     if cache_name:
         try:
             from google.generativeai import caching
             caching.CachedContent.get(cache_name).delete()
         except: pass
 
+    for res in task_results_all:
+        results[res["ticker"]] = res
+    return results
+
+async def process_from_excel(excel_path, model_name="gemini-2.5-flash", capture_only=False, max_concurrent=5, tickers_to_process=None, progress_callback=None):
+    df = read_excel_safely(excel_path, header=None)
+    if df is None: return {}
+
+    process_list = []
+    for index, row in df.iterrows():
+        if index == 0: continue
+        ticker = str(row.iloc[0]).strip().upper()
+        if pd.isna(row.iloc[0]) or ticker in ["NAN", ""]: continue
+        if tickers_to_process and ticker not in tickers_to_process: continue
+        period = str(row.iloc[1]).strip().lower() if not pd.isna(row.iloc[1]) else "1 year"
+        extra_rules = str(row.iloc[2]) if len(row) > 2 and not pd.isna(row.iloc[2]) else ""
+        process_list.append({"ticker": ticker, "period": period, "extra_rules": extra_rules, "row_idx": index})
+
+    results = await run_batch_core(process_list, model_name, capture_only, max_concurrent, progress_callback)
     if not capture_only:
-        await write_results_to_excel(excel_path, task_results_all)
+        await write_results_to_excel(excel_path, list(results.values()))
     return results
 
 async def process_single_stock_internal(ticker, period, extra_rules, date_str, model_name, capture_only, row_idx, cache_name=None):
