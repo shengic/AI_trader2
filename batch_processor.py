@@ -5,6 +5,7 @@ import random
 import pandas as pd
 from playwright.async_api import async_playwright
 from core_analyzer import analyze_stock
+from db_manager import save_report_to_db
 
 # Finviz 週期對照表
 PERIOD_MAPPING = {
@@ -29,242 +30,169 @@ async def internal_capture(url, output_path, selector=None, height=1500):
     """複刻 capture.py 的核心邏輯，確保參數一致"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        
         scale_factor = 4.166666666666667 # 400 DPI
-        user_agent = random.choice(USER_AGENTS)
-        
         context = await browser.new_context(
-            user_agent=user_agent,
+            user_agent=random.choice(USER_AGENTS),
             viewport={"width": 1280, "height": int(height)},
-            device_scale_factor=scale_factor,
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
-                "Referer": "https://www.google.com/"
-            }
+            device_scale_factor=scale_factor
         )
-        
         page = await context.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(5) # 等待渲染
-            
-            if selector:
-                element = await page.query_selector(selector)
-                if element:
-                    await element.screenshot(path=output_path)
-                else:
-                    await page.screenshot(path=output_path, full_page=False)
-            else:
-                await page.screenshot(path=output_path, full_page=False)
+            await asyncio.sleep(5)
+            await page.screenshot(path=output_path, full_page=False)
         finally:
             await browser.close()
 
 def get_finviz_url(ticker, period_str):
-    """根據 ticker 與週期字串生成 Finviz URL"""
-    mapping = PERIOD_MAPPING.get(period_str.lower())
-    if not mapping:
-        mapping = PERIOD_MAPPING["1 year"]
-    
-    p = mapping["p"]
-    r = mapping["r"]
-    # 使用 quote.ashx 確保參數正確傳遞
-    return f"https://finviz.com/quote.ashx?t={ticker}&p={p}&r={r}"
+    mapping = PERIOD_MAPPING.get(period_str.lower(), PERIOD_MAPPING["1 year"])
+    return f"https://finviz.com/quote.ashx?t={ticker}&p={mapping['p']}&r={mapping['r']}"
 
-async def process_single_stock(ticker, period, model_name="gemini-1.5-flash", capture_only=False):
-    """
-    處理單一股票的截圖與分析 (供 UI 直接調用)
-    """
-    ticker = str(ticker).strip().upper()
-    period = str(period).strip().lower()
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    
-    os.makedirs(f"captures/{today}", exist_ok=True)
-    os.makedirs(f"reports/{today}", exist_ok=True)
-    
-    url = get_finviz_url(ticker, period)
-    period_suffix = period.replace(' ', '_')
-    image_path = f"captures/{today}/{ticker}_{period_suffix}.png"
-    
+def read_excel_safely(path, **kwargs):
+    import shutil, tempfile
+    if not os.path.exists(path): return None
+    temp_path = os.path.join(tempfile.gettempdir(), f"temp_read_{os.path.basename(path)}")
     try:
-        await internal_capture(url, image_path, height=1500)
-        
-        report_path = f"reports/{today}/{ticker}_{period_suffix}.md"
-        if not capture_only:
-            report = await analyze_stock(ticker, image_path, model_name)
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write(report)
-        else:
-            if not os.path.exists(report_path):
-                with open(report_path, "w", encoding="utf-8") as f:
-                    f.write(f"# {ticker} ({period}) 分析報告\n\n(等待 AI 分析中...)")
-        return {"status": "success", "image_path": image_path}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        shutil.copy2(path, temp_path)
+        return pd.read_excel(temp_path, **kwargs)
+    finally:
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except: pass
 
-async def process_from_excel(excel_path, model_name="gemini-1.5-flash", capture_only=False, max_concurrent=5):
+async def process_from_excel(excel_path, model_name="gemini-2.5-flash", capture_only=False, max_concurrent=5, tickers_to_process=None, progress_callback=None):
     """
-    從 Excel 讀取名單並併發處理
+    從 Excel 讀取名單並併發處理，支援實時進度回報
     """
-    if not os.path.exists(excel_path):
-        return {}
+    df = read_excel_safely(excel_path, header=None)
+    if df is None: return {}
 
-    # 讀取 Excel (不設標題，手動處理)
-    df = pd.read_excel(excel_path, header=None) 
+    process_list = []
+    if tickers_to_process: tickers_to_process = [str(t).strip().upper() for t in tickers_to_process]
+    
+    for index, row in df.iterrows():
+        if index == 0: continue
+        ticker = str(row.iloc[0]).strip().upper()
+        if pd.isna(row.iloc[0]) or ticker in ["NAN", "STOCK NAME", ""]: continue
+        if tickers_to_process and ticker not in tickers_to_process: continue
+        period = str(row.iloc[1]).strip().lower() if not pd.isna(row.iloc[1]) else "1 year"
+        extra_rules = str(row.iloc[2]) if len(row) > 2 and not pd.isna(row.iloc[2]) else ""
+        process_list.append({"ticker": ticker, "period": period, "extra_rules": extra_rules, "row_idx": index})
 
-    results = {}
+    if not process_list: return {}
+    total = len(process_list)
     today = datetime.datetime.now().strftime("%Y%m%d")
-
     os.makedirs(f"captures/{today}", exist_ok=True)
     os.makedirs(f"reports/{today}", exist_ok=True)
+
+    cache_name = None
+    if not capture_only:
+        if progress_callback: progress_callback(0, total, "SYSTEM", "running", "正在初始化 AI 全域快取...")
+        try:
+            from core_analyzer import create_global_cache
+            # 2026 年模型映射
+            if "3.1" in model_name: cache_model = "gemini-3.1-flash-lite"
+            elif "2.5" in model_name: cache_model = "gemini-2.5-flash" if "flash" in model_name else "gemini-2.5-pro"
+            else: cache_model = "gemini-2.0-flash"
+            
+            cache = create_global_cache(cache_model)
+            cache_name = cache.name
+            if progress_callback: progress_callback(0, total, "SYSTEM", "success", "AI 全域快取建立完成")
+        except Exception as e:
+            if progress_callback: progress_callback(0, total, "SYSTEM", "warning", f"快取建立失敗: {e}")
 
     semaphore = asyncio.Semaphore(max_concurrent)
+    results = {}
+    completed_count = 0
 
-    async def sem_process_stock(ticker, period, row_idx):
+    async def wrapped_task(item):
+        nonlocal completed_count
         async with semaphore:
-            return await process_single_stock_internal(ticker, period, today, model_name, capture_only, row_idx)
+            if progress_callback:
+                progress_callback(completed_count, total, item["ticker"], "running", "開始擷取圖表與分析...")
+            res = await process_single_stock_internal(item["ticker"], item["period"], item["extra_rules"], today, model_name, capture_only, item["row_idx"], cache_name)
+            completed_count += 1
+            if progress_callback:
+                msg = res.get("summary", "完成") if res["status"] == "success" else res.get("message", "錯誤")
+                progress_callback(completed_count, total, res["ticker"], res["status"], msg)
+            return res
 
-    tasks = []
-    for index, row in df.iterrows():
-        # 跳過第一行 (標題) 或空白行
-        if index == 0: continue
+    tasks = [wrapped_task(item) for item in process_list]
+    task_results_all = await asyncio.gather(*tasks)
+    for res in task_results_all:
+        results[res["ticker"]] = res
 
-        ticker = row.iloc[0]
-        period = row.iloc[1] if len(row) > 1 else None
+    if cache_name:
+        try:
+            from google.generativeai import caching
+            caching.CachedContent.get(cache_name).delete()
+        except: pass
 
-        # 嚴格過濾無效 Ticker
-        if pd.isna(ticker) or str(ticker).strip().lower() in ["nan", "stock name", ""]: 
-            continue
-
-        ticker = str(ticker).strip().upper()
-        # 處理 Period 為 NaN 或 "nan" 字串的情況
-        if pd.isna(period) or str(period).strip().lower() in ["nan", ""]:
-            period = "1 year" 
-        else:
-            period = str(period).strip().lower()
-        
-        tasks.append(sem_process_stock(ticker, period, index))
-
-    # 執行併發任務
-    task_results = await asyncio.gather(*tasks)
-    
-    for res in task_results:
-        if res:
-            results[res["ticker"]] = res
-
-    # 寫入 Excel 結果 (待實作)
     if not capture_only:
-        await write_results_to_excel(excel_path, task_results)
-
+        await write_results_to_excel(excel_path, task_results_all)
     return results
 
-async def process_single_stock_internal(ticker, period, date_str, model_name, capture_only, row_idx):
-    """
-    內部處理邏輯，支援併發
-    """
+async def process_single_stock_internal(ticker, period, extra_rules, date_str, model_name, capture_only, row_idx, cache_name=None):
     url = get_finviz_url(ticker, period)
     period_suffix = period.replace(' ', '_')
     image_path = f"captures/{date_str}/{ticker}_{period_suffix}.png"
-    backup_path = f"captures/{date_str}/{ticker}_{period_suffix}_old.png"
     
     try:
         temp_image_path = f"captures/{date_str}/temp_{ticker}_{period_suffix}_{row_idx}.png"
-        print(f"正在擷取: {ticker} ({period})")
-        await internal_capture(url, temp_image_path, height=1500)
+        await internal_capture(url, temp_image_path)
         
         report_path = f"reports/{date_str}/{ticker}_{period_suffix}.md"
         capture_failed = False
-        
         if os.path.exists(temp_image_path):
-            # 擷取成功：直接覆蓋舊檔案
-            if os.path.exists(image_path):
-                os.remove(image_path)
+            if os.path.exists(image_path): os.remove(image_path)
             os.rename(temp_image_path, image_path)
         else:
-            # 擷取失敗
-            if os.path.exists(image_path):
-                capture_failed = True
-            else:
-                raise Exception("截圖檔案未產生且無舊圖")
+            if os.path.exists(image_path): capture_failed = True
+            else: raise Exception("截圖失敗且無舊圖")
 
         report_content = ""
         if not capture_only:
-            report_content = await analyze_stock(ticker, image_path, model_name)
-            
-            # 如果擷取失敗但有舊圖，在報告頂部加入註記
+            report_content = await analyze_stock(ticker, image_path, model_name, extra_rules, cache_name)
             if capture_failed:
                 file_time = datetime.datetime.fromtimestamp(os.path.getmtime(image_path)).strftime("%Y-%m-%d %H:%M:%S")
-                warning_msg = f"> ⚠️ **注意**：今日截圖失敗，目前顯示的是舊有圖片（擷取時間：{file_time}）。\n\n"
-                report_content = warning_msg + report_content
-                
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write(report_content)
+                report_content = f"> ⚠️ **注意**：今日截圖失敗，目前顯示的是舊有圖片（擷取時間：{file_time}）。\n\n" + report_content
+            with open(report_path, "w", encoding="utf-8") as f: f.write(report_content)
         else:
-            if not os.path.exists(report_path):
-                with open(report_path, "w", encoding="utf-8") as f:
-                    f.write(f"# {ticker} ({period}) 分析報告\n\n(等待 AI 分析中...)")
+            from db_manager import get_full_report
+            existing_db = get_full_report(ticker, period, date_str)
+            report_content = existing_db["report_content"] if existing_db else f"# {ticker} ({period}) 分析報告\n\n(等待 AI 分析中...)"
+            with open(report_path, "w", encoding="utf-8") as f: f.write(report_content)
+
+        try: save_report_to_db(ticker, period, report_content, image_path)
+        except: pass
         
-        return {
-            "ticker": ticker,
-            "status": "success",
-            "report_path": report_path,
-            "image_path": image_path,
-            "row_idx": row_idx,
-            "summary": report_content[:100].replace("\n", " ") + "..." if report_content else ""
-        }
+        return {"ticker": ticker, "status": "success", "row_idx": row_idx, "summary": report_content[:100].replace("\n", " ") + "..." if report_content else ""}
     except Exception as e:
-        print(f"處理 {ticker} 時發生錯誤: {e}")
-        return {
-            "ticker": ticker,
-            "status": "error",
-            "message": str(e),
-            "row_idx": row_idx
-        }
+        return {"ticker": ticker, "status": "error", "message": str(e), "row_idx": row_idx}
 
 async def write_results_to_excel(excel_path, task_results):
-    """
-    將分析結果寫回 Excel，並套用 Georgia 字體與置中對齊
-    """
     from openpyxl import load_workbook
     from openpyxl.styles import Font, Alignment
-
-    wb = load_workbook(excel_path)
-    ws = wb.active
-
-    # 確保有標題行
-    if ws.cell(row=1, column=4).value != "AI_Analysis":
-        ws.cell(row=1, column=4).value = "AI_Analysis"
-        ws.cell(row=1, column=5).value = "Last_Update"
-
-    georgia_font = Font(name="Georgia", size=11)
-    center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for res in task_results:
-        row = res["row_idx"] + 1 # openpyxl is 1-indexed
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        if res["status"] == "success":
-            ws.cell(row=row, column=4).value = res["summary"]
-            ws.cell(row=row, column=5).value = current_time
-        else:
-            ws.cell(row=row, column=4).value = f"Error: {res.get('message', 'Unknown')}"
-            ws.cell(row=row, column=5).value = current_time
-
-        # 套用格式
-        for col in range(1, 6):
-            cell = ws.cell(row=row, column=col)
-            cell.font = georgia_font
-            cell.alignment = center_alignment
-
-    # 套用標題格式
-    for col in range(1, 6):
-        cell = ws.cell(row=1, column=col)
-        cell.font = Font(name="Georgia", bold=True)
-        cell.alignment = center_alignment
-
-    wb.save(excel_path)
-
-
-if __name__ == "__main__":
-    # 測試代碼
-    # asyncio.run(process_from_excel("stocks.xlsx"))
-    pass
+    try:
+        wb = load_workbook(excel_path)
+        ws = wb.active
+        if ws.cell(row=1, column=4).value != "AI_Analysis":
+            ws.cell(row=1, column=4).value = "AI_Analysis"
+            ws.cell(row=1, column=5).value = "Last_Update"
+        georgia_font = Font(name="Georgia", size=11)
+        center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for res in task_results:
+            row = res["row_idx"] + 1
+            curr_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            if res["status"] == "success":
+                ws.cell(row=row, column=4).value = res["summary"]
+                ws.cell(row=row, column=5).value = curr_time
+            else:
+                ws.cell(row=row, column=4).value = f"Error: {res.get('message', 'Unknown')}"
+                ws.cell(row=row, column=5).value = curr_time
+            for col in range(1, 6):
+                cell = ws.cell(row=row, column=col)
+                cell.font = georgia_font
+                cell.alignment = center_alignment
+        wb.save(excel_path)
+    except: pass
